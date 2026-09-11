@@ -3,13 +3,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from api.routes import http, livekit
-from db.session import engine
+from db.session import engine, read_engine
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
     await engine.dispose()
+    await read_engine.dispose()
 
 
 app = FastAPI(title="VoxFlow AI", lifespan=lifespan)

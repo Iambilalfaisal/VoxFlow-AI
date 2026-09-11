@@ -65,12 +65,39 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-voxflow}:${POSTGRES_PASSWORD:-voxflow}@pgbouncer:5432/${POSTGRES_DB:-voxflow}
       MIGRATIONS_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-voxflow}:${POSTGRES_PASSWORD:-voxflow}@postgres:5432/${POSTGRES_DB:-voxflow}
+      # Inside the compose network this must be the service name, not
+      # .env's localhost:6379 (which is only correct when running outside
+      # Docker) - without this override the worker silently falls back to a
+      # Redis it can't reach.
+      REDIS_URL: redis://redis:6379/0
     command: python worker/agent.py dev
     volumes:
       - .:/app
     depends_on:
       pgbouncer:
         condition: service_started
+      redis:
+        condition: service_healthy
+
+  # Drains the history-events Redis stream that worker/agent.py publishes to
+  # and does the actual batched Postgres inserts. Kept as its own service so
+  # it scales independently of the audio-processing worker. Phase 1 runs
+  # exactly one instance - see worker/history_writer.py's module comment.
+  history-writer:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-voxflow}:${POSTGRES_PASSWORD:-voxflow}@pgbouncer:5432/${POSTGRES_DB:-voxflow}
+      MIGRATIONS_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-voxflow}:${POSTGRES_PASSWORD:-voxflow}@postgres:5432/${POSTGRES_DB:-voxflow}
+      REDIS_URL: redis://redis:6379/0
+    command: python worker/history_writer.py
+    volumes:
+      - .:/app
+    depends_on:
+      pgbouncer:
+        condition: service_started
+      redis:
+        condition: service_healthy
 
 volumes:
   pgdata:

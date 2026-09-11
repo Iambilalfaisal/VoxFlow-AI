@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
 
-from api.dependencies import CurrentUser, DbSession
+from api.dependencies import CurrentUser, DbSession, ReadDbSession
 from core.security import create_access_token, hash_password, verify_password
 from db.models import Conversation, Message, Organization, User
 
@@ -64,7 +64,7 @@ class ConversationResponse(BaseModel):
 
 
 @router.get("/conversations", response_model=list[ConversationResponse])
-async def list_conversations(db: DbSession, user: CurrentUser) -> list[Conversation]:
+async def list_conversations(db: ReadDbSession, user: CurrentUser) -> list[Conversation]:
     result = await db.scalars(
         select(Conversation)
         .where(Conversation.user_id == user.id)
@@ -84,7 +84,7 @@ class MessageResponse(BaseModel):
 
 @router.get("/conversations/{conversation_id}/messages", response_model=list[MessageResponse])
 async def list_messages(
-    conversation_id: uuid.UUID, db: DbSession, user: CurrentUser
+    conversation_id: uuid.UUID, db: ReadDbSession, user: CurrentUser
 ) -> list[Message]:
     conversation = await db.get(Conversation, conversation_id)
     if conversation is None or conversation.user_id != user.id:

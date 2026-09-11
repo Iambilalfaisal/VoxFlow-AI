@@ -61,6 +61,12 @@ class Message(Base):
     role: Mapped[str] = mapped_column(Text)  # "user" | "assistant" | "system"
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(_TZDateTime, server_default=func.now())
+    # Dedup key set by worker/agent.py at publish time. Nullable and
+    # unenforced for now (no unique constraint) - a crash between a
+    # history_writer insert-commit and its queue ack can still produce a
+    # duplicate row. Populated now so no historical-data backfill is needed
+    # later if/when insert-side dedup enforcement is added.
+    event_id: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
 

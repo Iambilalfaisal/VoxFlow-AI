@@ -24,10 +24,15 @@ from livekit.plugins import silero  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 
 from core.config import settings  # noqa: E402
-from db.models import Conversation, Message  # noqa: E402
+from db.models import Conversation  # noqa: E402
 from db.session import async_session_maker  # noqa: E402
+from services.queue import RedisStreamQueue  # noqa: E402
 
 logger = logging.getLogger("voxflow.worker")
+
+# Module-level singleton, same pattern as db/session.py's `engine` - one
+# shared connection pool for the whole worker process.
+_queue = RedisStreamQueue(settings.redis_url)
 
 # Uses LiveKit Inference (https://docs.livekit.io) for the STT -> LLM -> TTS
 # pipeline: model strings are routed and billed through LiveKit Cloud, so no
@@ -48,6 +53,60 @@ class PendingMessage:
     role: str
     content: str
     created_at: datetime
+
+
+def _build_publish_payload(batch: list[PendingMessage]) -> dict:
+    """Build the JSON-serializable payload published for one flushed batch.
+
+    Extracted to module level (see `_publish_with_retry`) so payload shape -
+    including the per-event dedup `event_id` - is directly unit-testable.
+    """
+    return {
+        "events": [
+            {
+                "event_id": str(uuid.uuid4()),
+                "conversation_id": str(item.conversation_id),
+                "role": item.role,
+                "content": item.content,
+                "created_at": item.created_at.isoformat(),
+            }
+            for item in batch
+        ]
+    }
+
+
+async def _publish_with_retry(payload: dict, batch_size: int) -> bool:
+    """Publish `payload` to the history stream, retrying with backoff.
+
+    Extracted to module level (out of entrypoint()'s flush_buffer closure)
+    so it's unit-testable against a fake `_queue` without needing a real
+    LiveKit JobContext. Returns True on success, False if every attempt
+    failed - the caller decides what to do with a failed batch.
+    """
+    delay = settings.history_publish_retry_backoff_seconds
+    for attempt in range(1, settings.history_publish_max_retries + 1):
+        try:
+            await _queue.publish(settings.history_stream_name, payload)
+            logger.info("published %d buffered transcript message(s)", batch_size)
+            return True
+        except Exception:
+            logger.warning(
+                "publish attempt %d/%d failed for %d buffered message(s)",
+                attempt,
+                settings.history_publish_max_retries,
+                batch_size,
+                exc_info=True,
+            )
+            if attempt < settings.history_publish_max_retries:
+                await asyncio.sleep(delay)
+                delay *= 2
+
+    logger.error(
+        "failed to publish %d buffered message(s) after %d attempts; requeuing for next flush",
+        batch_size,
+        settings.history_publish_max_retries,
+    )
+    return False
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -98,21 +157,16 @@ async def entrypoint(ctx: JobContext) -> None:
         if not buffer:
             return
         batch, buffer[:] = buffer[:], []
-        try:
-            async with async_session_maker() as db:
-                async with db.begin():
-                    db.add_all(
-                        Message(
-                            conversation_id=item.conversation_id,
-                            role=item.role,
-                            content=item.content,
-                            created_at=item.created_at,
-                        )
-                        for item in batch
-                    )
-            logger.info("persisted %d buffered transcript message(s)", len(batch))
-        except Exception:
-            logger.exception("failed to persist %d buffered transcript message(s)", len(batch))
+        payload = _build_publish_payload(batch)
+
+        # If every publish attempt fails, requeue the batch at the front of
+        # `buffer` (preserving order against anything appended meanwhile)
+        # instead of discarding it, so the next flush cycle retries it. The
+        # old direct-DB-write path dropped a batch on first failure, which
+        # is a silent data-loss gap we don't want to carry forward now that
+        # durability is the point of the queue.
+        if not await _publish_with_retry(payload, len(batch)):
+            buffer[0:0] = batch
 
     async def flush_worker() -> None:
         while True:

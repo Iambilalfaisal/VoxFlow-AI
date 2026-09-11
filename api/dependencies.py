@@ -7,9 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.security import decode_access_token
 from db.models import User
-from db.session import get_session
+from db.session import get_read_session, get_session
 
 DbSession = Annotated[AsyncSession, Depends(get_session)]
+
+# Read-only endpoints (history reads) use this instead of DbSession so they
+# can target a read replica later without touching the write path.
+ReadDbSession = Annotated[AsyncSession, Depends(get_read_session)]
 
 _bearer_scheme = HTTPBearer()
 

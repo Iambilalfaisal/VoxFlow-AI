@@ -20,3 +20,28 @@ async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
 async def get_session() -> AsyncSession:
     async with async_session_maker() as session:
         yield session
+
+
+def _resolve_read_dsn() -> str:
+    """Points at settings.database_read_url once a read replica exists;
+    falls back to the same write engine's DSN today. Extracted to a
+    function (rather than inlined below) so the fallback is directly
+    unit-testable without reconstructing real engines."""
+    return settings.database_read_url or settings.database_url
+
+
+# Read-path seam. Kept as a separate engine (not just a separate
+# sessionmaker on `engine`) so a future replica DSN takes effect without
+# touching the write path.
+read_engine = create_async_engine(
+    _resolve_read_dsn(),
+    poolclass=NullPool,
+    connect_args={"statement_cache_size": 0},
+)
+
+read_session_maker = async_sessionmaker(read_engine, expire_on_commit=False)
+
+
+async def get_read_session() -> AsyncSession:
+    async with read_session_maker() as session:
+        yield session
