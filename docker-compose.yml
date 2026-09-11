@@ -42,5 +42,35 @@ services:
       timeout: 5s
       retries: 10
 
+  api:
+    build: .
+    env_file: .env
+    environment:
+      # Inside the compose network we use service names/internal ports, not
+      # the host-published ones .env has for running outside Docker.
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-voxflow}:${POSTGRES_PASSWORD:-voxflow}@pgbouncer:5432/${POSTGRES_DB:-voxflow}
+      MIGRATIONS_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-voxflow}:${POSTGRES_PASSWORD:-voxflow}@postgres:5432/${POSTGRES_DB:-voxflow}
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      pgbouncer:
+        condition: service_started
+
+  worker:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-voxflow}:${POSTGRES_PASSWORD:-voxflow}@pgbouncer:5432/${POSTGRES_DB:-voxflow}
+      MIGRATIONS_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-voxflow}:${POSTGRES_PASSWORD:-voxflow}@postgres:5432/${POSTGRES_DB:-voxflow}
+    command: python worker/agent.py dev
+    volumes:
+      - .:/app
+    depends_on:
+      pgbouncer:
+        condition: service_started
+
 volumes:
   pgdata:
