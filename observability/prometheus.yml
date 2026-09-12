@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: voxflow-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+
+  - job_name: voxflow-worker
+    static_configs:
+      - targets: ["worker:9090"]
+
+  - job_name: voxflow-history-writer
+    static_configs:
+      - targets: ["history-writer:9091"]
+
+  # Port depends on the pgbouncer-exporter image actually installed (compose
+  # service uses spreaker/prometheus-pgbouncer-exporter, default 9127) -
+  # adjust if you swap images.
+  - job_name: pgbouncer
+    static_configs:
+      - targets: ["pgbouncer-exporter:9127"]

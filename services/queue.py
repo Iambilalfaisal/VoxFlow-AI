@@ -133,3 +133,35 @@ class RedisStreamQueue:
         await self._redis.xadd(dlq_stream, {"data": json.dumps(dlq_payload)})
         # Ack the original so it stops being redelivered/reclaimable.
         await self._redis.xack(stream, group, message.id)
+
+    async def stream_len(self, stream: str) -> int:
+        """XLEN - observability-only, not part of the MessageQueue interface
+        (a future SQS/Kafka backend has no equivalent concept of stream
+        length in this sense)."""
+        return await self._redis.xlen(stream)
+
+    async def pending_count(self, stream: str, group: str) -> int:
+        """Count of delivered-but-unacked entries (XPENDING summary form),
+        for the history-writer's consumer-lag gauge."""
+        summary = await self._redis.xpending(stream, group)
+        return summary["pending"] if summary else 0
+
+    async def trim(self, stream: str, group: str, fallback_maxlen: int) -> None:
+        """Bound stream growth. XACK does not delete entries - only
+        XTRIM/XDEL do - so without this, `stream` grows forever regardless
+        of whether entries are acked.
+
+        Anchored to the oldest still-pending (unacked) entry when one
+        exists: `XTRIM MINID` only deletes entries older than that anchor,
+        so it can never remove something not yet safely processed -
+        including a stuck poison entry a future delivery might still
+        dead-letter. When nothing is pending, there's no such anchor, so
+        this falls back to an approximate MAXLEN cap purely to bound memory
+        growth, not to enforce a processing guarantee.
+        """
+        summary = await self._redis.xpending(stream, group)
+        min_pending_id = summary.get("min") if summary else None
+        if min_pending_id is not None:
+            await self._redis.xtrim(stream, minid=min_pending_id, approximate=True)
+        else:
+            await self._redis.xtrim(stream, maxlen=fallback_maxlen, approximate=True)

@@ -20,10 +20,27 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import worker.history_writer as history_writer_module
+from core import metrics as core_metrics
 from core.config import settings
 from db.models import Base, Conversation, Message, Organization, User
 from db.session import async_session_maker
 from services.queue import RedisStreamQueue
+
+
+def _counter_value(counter, **labels) -> float:
+    for metric in counter.collect():
+        for sample in metric.samples:
+            if sample.name.endswith("_total") and sample.labels == labels:
+                return sample.value
+    return 0.0
+
+
+def _histogram_count(histogram) -> float:
+    for metric in histogram.collect():
+        for sample in metric.samples:
+            if sample.name.endswith("_count"):
+                return sample.value
+    return 0.0
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -154,3 +171,39 @@ async def test_threshold_exceeded_lands_in_dlq_via_real_reclaim(queue, monkeypat
 
     dlq_entries = await queue._redis.xrange(f"{stream}:dlq")
     assert len(dlq_entries) == 1
+
+
+async def test_insert_updates_throughput_metrics(queue, conversation):
+    stream = history_writer_module.settings.history_stream_name
+    group = history_writer_module.settings.history_consumer_group
+    await queue.ensure_group(stream, group)
+    await queue.publish(stream, {"events": [_event(conversation), _event(conversation)]})
+
+    rows_before = _counter_value(core_metrics.HISTORY_WRITER_ROWS_TOTAL)
+    batches_before = _histogram_count(core_metrics.HISTORY_WRITER_BATCH_LATENCY_SECONDS)
+
+    await _drive_loop(queue, "writer-1", iterations=1)
+
+    assert _counter_value(core_metrics.HISTORY_WRITER_ROWS_TOTAL) == rows_before + 2
+    assert (
+        _histogram_count(core_metrics.HISTORY_WRITER_BATCH_LATENCY_SECONDS) == batches_before + 1
+    )
+
+
+async def test_dead_letter_increments_counter(queue, monkeypatch):
+    monkeypatch.setattr(history_writer_module.settings, "history_writer_max_deliveries", 2)
+
+    stream = history_writer_module.settings.history_stream_name
+    group = history_writer_module.settings.history_consumer_group
+    poison_conversation_id = uuid.uuid4()  # every insert attempt fails (FK violation)
+    await queue.ensure_group(stream, group)
+    await queue.publish(stream, {"events": [_event(poison_conversation_id)]})
+
+    dead_lettered_before = _counter_value(core_metrics.HISTORY_WRITER_DEAD_LETTERED_TOTAL)
+
+    await _drive_loop(queue, "writer-1", iterations=5)
+
+    assert (
+        _counter_value(core_metrics.HISTORY_WRITER_DEAD_LETTERED_TOTAL)
+        == dead_lettered_before + 1
+    )

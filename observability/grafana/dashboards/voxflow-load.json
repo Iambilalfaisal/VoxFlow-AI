@@ -1,0 +1,104 @@
+{
+  "title": "VoxFlow Load",
+  "uid": "voxflow-load",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Active sessions",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "sum(voxflow_active_sessions)", "legendFormat": "sessions" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Worker instances",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        { "expr": "count(up{job=\"voxflow-worker\"} == 1)", "legendFormat": "workers" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Backlog (consumer lag)",
+      "description": "The real write-path-saturation signal: entries delivered but not yet acked (XPENDING). Rising and not recovering during a hold = the writer is falling behind. Do NOT use the XLEN-based panel below for this - XACK never shrinks a stream, so raw stream length climbs forever regardless of whether the writer keeps up.",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "voxflow_history_stream_pending", "legendFormat": "{{stream}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "DLQ depth",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        { "expr": "voxflow_history_dlq_depth", "legendFormat": "{{stream}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Provider p99 latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(voxflow_provider_latency_seconds_bucket[5m])) by (le, provider))",
+          "legendFormat": "{{provider}} p99"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Provider 429 rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        {
+          "expr": "sum(rate(voxflow_provider_rate_limited_total[5m])) by (provider)",
+          "legendFormat": "{{provider}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "History stream size (XLEN, informational)",
+      "description": "Total entries currently in the stream (trimmed periodically by history_writer.py - see RedisStreamQueue.trim). This is NOT a backlog indicator: it reflects retention/trim cadence, not whether the writer is keeping up. Use the 'Backlog (consumer lag)' panel above for that.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 14 },
+      "targets": [
+        { "expr": "voxflow_history_stream_depth", "legendFormat": "{{stream}}" }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "pgBouncer pool saturation",
+      "description": "Metric name depends on the exact pgbouncer-exporter image installed - adjust the query if you swap it (see docker-compose.yml's pgbouncer-exporter service).",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 14 },
+      "targets": [
+        { "expr": "pgbouncer_pools_server_active_connections", "legendFormat": "active" },
+        { "expr": "pgbouncer_pools_server_idle_connections", "legendFormat": "idle" }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Worker CPU",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 14 },
+      "targets": [
+        {
+          "expr": "rate(process_cpu_seconds_total{job=\"voxflow-worker\"}[5m])",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    }
+  ]
+}

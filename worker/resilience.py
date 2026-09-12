@@ -9,6 +9,8 @@ from livekit.agents.types import (
     NotGivenOr,
 )
 
+from core.metrics import PROVIDER_IN_FLIGHT
+
 
 class ProviderBudget:
     """Caps concurrent in-flight work against one provider.
@@ -26,10 +28,12 @@ class ProviderBudget:
     async def __aenter__(self) -> "ProviderBudget":
         await self._sem.acquire()
         self._in_flight += 1
+        PROVIDER_IN_FLIGHT.labels(provider=self._name).set(self._in_flight)
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
         self._in_flight -= 1
+        PROVIDER_IN_FLIGHT.labels(provider=self._name).set(self._in_flight)
         self._sem.release()
 
     @property

@@ -73,7 +73,13 @@ async def test_publish_succeeds_on_first_try(monkeypatch):
     ok = await agent_module._publish_with_retry(payload, batch_size=1)
 
     assert ok is True
-    assert fake.calls == [payload]
+    # _publish_with_retry adds a "_trace" carrier (trace-context propagation
+    # to history_writer.py) on top of the original payload - same events,
+    # plus that one extra key.
+    assert len(fake.calls) == 1
+    published = fake.calls[0]
+    assert published["events"] == payload["events"]
+    assert "traceparent" in published["_trace"]
 
 
 async def test_publish_retries_then_succeeds(monkeypatch):

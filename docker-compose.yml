@@ -70,6 +70,11 @@ services:
       # Docker) - without this override the worker silently falls back to a
       # Redis it can't reach.
       REDIS_URL: redis://redis:6379/0
+      # Only the worker needs this: every job runs in its own OS subprocess
+      # (LiveKit Agents' process pool), so Prometheus metrics must use
+      # multiprocess mode (see core/metrics.py) rather than one in-memory
+      # registry that a job's process would take with it on exit.
+      PROMETHEUS_MULTIPROC_DIR: /tmp/voxflow-metrics
     command: python worker/agent.py dev
     volumes:
       - .:/app
@@ -98,6 +103,58 @@ services:
         condition: service_started
       redis:
         condition: service_healthy
+
+  # --- Observability (Phase 3 Part A) ---------------------------------------
+  # Scrapes /metrics on api, worker (:9090), history-writer (:9091) - see
+  # core/metrics.py and observability/prometheus.yml. Gated app-side by
+  # settings.enable_observability, not by anything here.
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+      - worker
+      - history-writer
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - jaeger
+
+  # All-in-one Jaeger: UI + OTLP HTTP receiver (core/tracing.py's
+  # OTEL_EXPORTER_OTLP_TRACES_ENDPOINT points at :4318/v1/traces).
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+
+  # Community exporter for pgbouncer's own SHOW POOLS stats - not hand-parsed
+  # here. Swap the image if you prefer a different maintained exporter.
+  pgbouncer-exporter:
+    image: spreaker/prometheus-pgbouncer-exporter:latest
+    environment:
+      PGBOUNCER_EXPORT_HOST: pgbouncer
+      PGBOUNCER_EXPORT_PORT: "5432"
+      PGBOUNCER_EXPORT_USER: ${POSTGRES_USER:-voxflow}
+      PGBOUNCER_EXPORT_PASSWORD: ${POSTGRES_PASSWORD:-voxflow}
+    depends_on:
+      pgbouncer:
+        condition: service_started
 
 volumes:
   pgdata:

@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import logging
+import multiprocessing
 import sys
 import uuid
 from dataclasses import dataclass
@@ -24,15 +25,28 @@ from livekit.agents.llm import ChatMessage, FallbackAdapter as LLMFallbackAdapte
 from livekit.agents.stt import FallbackAdapter as STTFallbackAdapter  # noqa: E402
 from livekit.agents.tts import FallbackAdapter as TTSFallbackAdapter  # noqa: E402
 from livekit.plugins import silero  # noqa: E402
+from opentelemetry import propagate, trace as otel_trace  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 
+from core import metrics as core_metrics  # noqa: E402
 from core.config import settings  # noqa: E402
+from core.tracing import configure_tracing  # noqa: E402
 from db.models import Conversation  # noqa: E402
 from db.session import async_session_maker  # noqa: E402
 from services.queue import RedisStreamQueue  # noqa: E402
 from worker.resilience import BudgetedLLM, ProviderBudget  # noqa: E402
 
 logger = logging.getLogger("voxflow.worker")
+
+configure_tracing("voxflow-worker")
+# Every job runs in its own spawned subprocess, which re-imports this file -
+# only the main process may bind the metrics port, or every job subprocess
+# crashes trying to rebind it (see core/metrics.py's multiprocess-mode note;
+# job subprocesses still contribute metrics without serving HTTP themselves).
+if settings.enable_observability and multiprocessing.current_process().name == "MainProcess":
+    core_metrics.start_metrics_server(settings.metrics_port_worker)
+
+_tracer = otel_trace.get_tracer("voxflow.worker")
 
 # Module-level singletons, same pattern as db/session.py's `engine` - one
 # shared connection pool / budget for the whole worker process, not
@@ -51,6 +65,7 @@ def _log_availability(kind: str):
         instance = getattr(event, kind)
         state = "available" if event.available else "UNAVAILABLE"
         logger.warning("%s provider %s is now %s", kind, instance.label, state)
+        core_metrics.handle_availability_changed(kind, event.available)
 
     return _handler
 
@@ -130,29 +145,40 @@ async def _publish_with_retry(payload: dict, batch_size: int) -> bool:
     failed - the caller decides what to do with a failed batch.
     """
     delay = settings.history_publish_retry_backoff_seconds
-    for attempt in range(1, settings.history_publish_max_retries + 1):
-        try:
-            await _queue.publish(settings.history_stream_name, payload)
-            logger.info("published %d buffered transcript message(s)", batch_size)
-            return True
-        except Exception:
-            logger.warning(
-                "publish attempt %d/%d failed for %d buffered message(s)",
-                attempt,
-                settings.history_publish_max_retries,
-                batch_size,
-                exc_info=True,
-            )
-            if attempt < settings.history_publish_max_retries:
-                await asyncio.sleep(delay)
-                delay *= 2
+    with _tracer.start_as_current_span("history.publish"):
+        # Carries the publishing span's context across the Redis-queue
+        # boundary so history_writer.py can parent its DB-insert span to it.
+        # A missing/empty carrier on the consumer side (e.g. this field
+        # didn't exist on messages published before this change) just means
+        # propagate.extract() returns an empty context - the consumer starts
+        # a fresh trace rather than erroring, so replaying old entries is safe.
+        trace_carrier: dict[str, str] = {}
+        propagate.inject(trace_carrier)
+        payload = {**payload, "_trace": trace_carrier}
 
-    logger.error(
-        "failed to publish %d buffered message(s) after %d attempts; requeuing for next flush",
-        batch_size,
-        settings.history_publish_max_retries,
-    )
-    return False
+        for attempt in range(1, settings.history_publish_max_retries + 1):
+            try:
+                await _queue.publish(settings.history_stream_name, payload)
+                logger.info("published %d buffered transcript message(s)", batch_size)
+                return True
+            except Exception:
+                logger.warning(
+                    "publish attempt %d/%d failed for %d buffered message(s)",
+                    attempt,
+                    settings.history_publish_max_retries,
+                    batch_size,
+                    exc_info=True,
+                )
+                if attempt < settings.history_publish_max_retries:
+                    await asyncio.sleep(delay)
+                    delay *= 2
+
+        logger.error(
+            "failed to publish %d buffered message(s) after %d attempts; requeuing for next flush",
+            batch_size,
+            settings.history_publish_max_retries,
+        )
+        return False
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -241,6 +267,12 @@ async def entrypoint(ctx: JobContext) -> None:
         tts=tts_pipeline,
     )
     session.on("conversation_item_added", on_conversation_item_added)
+    # livekit-agents' own per-request metrics (STT/LLM/TTS duration, ttft/
+    # ttfb) and error events (including 429s, via APIStatusError.status_code)
+    # - fed straight into Prometheus rather than re-timing each provider call
+    # ourselves. See core/metrics.py.
+    session.on("metrics_collected", core_metrics.handle_metrics_collected)
+    session.on("error", core_metrics.handle_provider_error)
 
     agent = Agent(instructions="You are VoxFlow, a helpful, concise voice assistant.")
 
@@ -248,8 +280,12 @@ async def entrypoint(ctx: JobContext) -> None:
     # streams, not discrete per-turn requests like the LLM) - this caps how
     # many concurrent calls this worker process will have an active STT/TTS
     # stream for. Released automatically on any exit path.
-    async with _stt_budget, _tts_budget:
-        await session.start(agent=agent, room=ctx.room)
+    core_metrics.ACTIVE_SESSIONS.inc()
+    try:
+        async with _stt_budget, _tts_budget:
+            await session.start(agent=agent, room=ctx.room)
+    finally:
+        core_metrics.ACTIVE_SESSIONS.dec()
 
 
 if __name__ == "__main__":

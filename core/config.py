@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     # How long a stream entry sits unacked before XAUTOCLAIM will reclaim it
     # (e.g. the writer that read it crashed before ack/dead-letter).
     history_writer_min_idle_ms: int = 30000
+    # XACK does not shrink a Redis Stream - only XTRIM/XDEL do. Without
+    # trimming, history_writer.py's poll loop would grow the stream forever
+    # regardless of whether it's keeping up. The trim floor is anchored to
+    # the oldest still-pending (unacked) entry when one exists (never
+    # deletes anything not yet safely processed); this cap is only the
+    # fallback for when nothing is pending, so it just bounds memory growth.
+    history_stream_trim_maxlen: int = 100_000
     history_publish_max_retries: int = 3
     history_publish_retry_backoff_seconds: float = 0.5  # doubles each attempt
 
@@ -53,6 +60,18 @@ class Settings(BaseSettings):
     llm_max_concurrent: int = 10
     stt_max_concurrent: int = 10
     tts_max_concurrent: int = 10
+
+    # Observability (Phase 3 Part A) - Prometheus metrics + OpenTelemetry
+    # tracing to a local Jaeger, gated by one flag so it can be disabled
+    # cleanly (e.g. a baseline load-test run measuring its own overhead).
+    enable_observability: bool = True
+    metrics_port_worker: int = 9090
+    metrics_port_history_writer: int = 9091
+    otel_exporter_otlp_traces_endpoint: str = "http://jaeger:4318/v1/traces"
+    # Diagnostic tracing to find stall patterns under load, not a full audit
+    # trail - full-rate span creation would add overhead on the exact path
+    # (audio loop, provider calls) a load test is trying to measure cleanly.
+    trace_sample_ratio: float = 0.01
 
     livekit_url: str
     livekit_api_key: str
