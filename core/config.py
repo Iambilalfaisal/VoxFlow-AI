@@ -36,6 +36,24 @@ class Settings(BaseSettings):
     history_publish_max_retries: int = 3
     history_publish_retry_backoff_seconds: float = 0.5  # doubles each attempt
 
+    # STT/LLM/TTS pipeline (worker/agent.py) - all routed through LiveKit
+    # Inference, so these are model-ID strings, not separate provider API
+    # keys. Fallback chain per CLAUDE.md §5a: never hard-fail a live call.
+    stt_model: str = "deepgram/nova-3:en"
+    stt_fallback_model: str = "cartesia/ink-whisper"
+    llm_model: str = "openai/gpt-4.1-mini"
+    llm_fallback_model: str = "openai/gpt-4o-mini"
+    tts_model: str = "cartesia/sonic-3:6f84f4b8-58a2-430c-8c79-688dad597532"
+    tts_fallback_model: str = "deepgram/aura-2"
+
+    # Concurrency budgets: local asyncio.Semaphore now, seam for a
+    # distributed Redis token-bucket later (see worker/resilience.py). One
+    # budget per pipeline stage, shared across primary+fallback within that
+    # stage and across every session this worker process handles.
+    llm_max_concurrent: int = 10
+    stt_max_concurrent: int = 10
+    tts_max_concurrent: int = 10
+
     livekit_url: str
     livekit_api_key: str
     livekit_api_secret: str

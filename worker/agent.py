@@ -18,8 +18,11 @@ from livekit.agents import (  # noqa: E402
     JobContext,
     WorkerOptions,
     cli,
+    inference,
 )
-from livekit.agents.llm import ChatMessage  # noqa: E402
+from livekit.agents.llm import ChatMessage, FallbackAdapter as LLMFallbackAdapter  # noqa: E402
+from livekit.agents.stt import FallbackAdapter as STTFallbackAdapter  # noqa: E402
+from livekit.agents.tts import FallbackAdapter as TTSFallbackAdapter  # noqa: E402
 from livekit.plugins import silero  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 
@@ -27,24 +30,67 @@ from core.config import settings  # noqa: E402
 from db.models import Conversation  # noqa: E402
 from db.session import async_session_maker  # noqa: E402
 from services.queue import RedisStreamQueue  # noqa: E402
+from worker.resilience import BudgetedLLM, ProviderBudget  # noqa: E402
 
 logger = logging.getLogger("voxflow.worker")
 
-# Module-level singleton, same pattern as db/session.py's `engine` - one
-# shared connection pool for the whole worker process.
+# Module-level singletons, same pattern as db/session.py's `engine` - one
+# shared connection pool / budget for the whole worker process, not
+# per-session, so they actually bound the fleet's total concurrent usage.
 _queue = RedisStreamQueue(settings.redis_url)
-
-# Uses LiveKit Inference (https://docs.livekit.io) for the STT -> LLM -> TTS
-# pipeline: model strings are routed and billed through LiveKit Cloud, so no
-# separate Deepgram/OpenAI/Cartesia accounts or API keys are needed while
-# we're on free tiers. Swap the strings below for direct provider plugins
-# later if we outgrow LiveKit Inference's included usage.
-STT_MODEL = "deepgram/nova-3:en"
-LLM_MODEL = "openai/gpt-4.1-mini"
-TTS_MODEL = "cartesia/sonic-3:6f84f4b8-58a2-430c-8c79-688dad597532"
+_llm_budget = ProviderBudget("llm", settings.llm_max_concurrent)
+_stt_budget = ProviderBudget("stt", settings.stt_max_concurrent)
+_tts_budget = ProviderBudget("tts", settings.tts_max_concurrent)
 
 FLUSH_INTERVAL_SECONDS = 5
 FLUSH_BATCH_SIZE = 10
+
+
+def _log_availability(kind: str):
+    def _handler(event) -> None:
+        instance = getattr(event, kind)
+        state = "available" if event.available else "UNAVAILABLE"
+        logger.warning("%s provider %s is now %s", kind, instance.label, state)
+
+    return _handler
+
+
+def _build_pipeline() -> tuple[STTFallbackAdapter, LLMFallbackAdapter, TTSFallbackAdapter]:
+    """Build the STT/LLM/TTS pipeline for one session.
+
+    Every provider call goes through two layers, per CLAUDE.md §5a:
+    - FallbackAdapter (from livekit-agents itself): a closed/open/half-open
+      circuit breaker plus an ordered fallback chain. Reused rather than
+      reimplemented - it's the framework's own machinery that AgentSession
+      calls into, not a parallel structure only our code would use.
+    - ProviderBudget (worker/resilience.py): a concurrency cap the SDK
+      doesn't provide on its own, since FallbackAdapter only reacts to
+      failures rather than throttling proactively.
+
+    All models route through LiveKit Inference (no separate Deepgram/OpenAI/
+    Cartesia API keys needed). Fallbacks are cross-provider for STT/TTS and a
+    cheaper same-provider tier for LLM (the OpenAI-vs-Anthropic choice in
+    CLAUDE.md §4 is still open; this doesn't relitigate it).
+    """
+    stt_pipeline = STTFallbackAdapter(
+        [inference.STT(settings.stt_model), inference.STT(settings.stt_fallback_model)]
+    )
+    stt_pipeline.on("stt_availability_changed", _log_availability("stt"))
+
+    llm_pipeline = LLMFallbackAdapter(
+        [
+            BudgetedLLM(inference.LLM(settings.llm_model), _llm_budget),
+            BudgetedLLM(inference.LLM(settings.llm_fallback_model), _llm_budget),
+        ]
+    )
+    llm_pipeline.on("llm_availability_changed", _log_availability("llm"))
+
+    tts_pipeline = TTSFallbackAdapter(
+        [inference.TTS(settings.tts_model), inference.TTS(settings.tts_fallback_model)]
+    )
+    tts_pipeline.on("tts_availability_changed", _log_availability("tts"))
+
+    return stt_pipeline, llm_pipeline, tts_pipeline
 
 
 @dataclass
@@ -187,17 +233,23 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(on_shutdown)
 
+    stt_pipeline, llm_pipeline, tts_pipeline = _build_pipeline()
     session = AgentSession(
         vad=silero.VAD.load(),
-        stt=STT_MODEL,
-        llm=LLM_MODEL,
-        tts=TTS_MODEL,
+        stt=stt_pipeline,
+        llm=llm_pipeline,
+        tts=tts_pipeline,
     )
     session.on("conversation_item_added", on_conversation_item_added)
 
     agent = Agent(instructions="You are VoxFlow, a helpful, concise voice assistant.")
 
-    await session.start(agent=agent, room=ctx.room)
+    # STT/TTS budgets are held for the whole call (they're long-lived
+    # streams, not discrete per-turn requests like the LLM) - this caps how
+    # many concurrent calls this worker process will have an active STT/TTS
+    # stream for. Released automatically on any exit path.
+    async with _stt_budget, _tts_budget:
+        await session.start(agent=agent, room=ctx.room)
 
 
 if __name__ == "__main__":
